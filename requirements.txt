@@ -1,7 +1,6 @@
 streamlit
+yfinance
+FinMind
 pandas
 requests
-yfinance
-streamlit-cookies-manager
-requests-cache
-cryptography
+pytz
