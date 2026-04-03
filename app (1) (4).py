@@ -49,7 +49,7 @@ if 'initialized' not in st.session_state:
     st.session_state.alert_history = {}
 
 # --- 2. 頁面配置 ---
-st.set_page_config(page_title="台股自選監控 V3.1", layout="centered")
+st.set_page_config(page_title="台股自選監控 V3.2", layout="centered")
 st.markdown("""
     <style>
     [data-testid="stMetricDelta"] svg { display: none; }
@@ -66,14 +66,14 @@ def get_market_status():
         return f"💤 休市中 (週末) - {now_tw.strftime('%H:%M')}", False
     current_time = now_tw.time()
     if dt_time(9, 0) <= current_time <= dt_time(13, 35):
-        return f"⚡ 開盤中 (即時監控) - {now_tw.strftime('%H:%M')}", True
+        return f"⚡ 開盤中 (自動監控) - {now_tw.strftime('%H:%M')}", True
     return f"🌙 休市中 (暫停自動通知) - {now_tw.strftime('%H:%M')}", False
 
 def send_telegram_msg(token, chat_id, message):
     if token and chat_id:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         try:
-            res = requests.post(url, json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}, timeout=8)
+            res = requests.post(url, json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}, timeout=10)
             return res.json().get("ok", False)
         except: return False
     return False
@@ -134,30 +134,34 @@ with st.expander("🛠️ 管理自選股與通知設定"):
     c_save, c_test = st.columns(2)
     if c_save.button("💾 儲存設定"):
         save_data()
-        st.success("設定已存入伺服器！")
+        st.success("設定已儲存！")
     
-    # --- 手動測試按鈕 ---
-    if c_test.button("🚀 發送即時測試通知"):
+    # --- 手動全掃描測試按鈕 ---
+    if c_test.button("🚀 執行手動全掃描測試"):
         if st.session_state.tg_token and st.session_state.tg_chat_id and st.session_state.my_stocks:
-            test_stock = st.session_state.my_stocks[0]
-            data = get_stock_data(test_stock["id"])
-            if data:
-                test_msg = (f"🧪 <b>【手動測試通知】</b>\n\n"
-                            f"標的：<b>{test_stock['name']} ({test_stock['id']})</b>\n"
-                            f"成交：{data['price']:.2f}\n"
-                            f"幅度：{data['pct']:+.2f}%\n"
-                            f"狀態：非交易時段測試正常\n"
-                            f"時間：{datetime.now(tw_tz).strftime('%H:%M:%S')}")
-                if send_telegram_msg(st.session_state.tg_token, st.session_state.tg_chat_id, test_msg):
-                    st.toast("✅ 測試通知發送成功！", icon="🚀")
+            with st.spinner("正在掃描清單並檢查門檻..."):
+                sent_count = 0
+                for stock in st.session_state.my_stocks:
+                    data = get_stock_data(stock["id"])
+                    if data and abs(data['pct']) >= st.session_state.tg_threshold:
+                        msg = (f"🧪 <b>【手動掃描測試】</b>\n\n"
+                               f"標的：<b>{stock['name']} ({stock['id']})</b>\n"
+                               f"成交：{data['price']:.2f}\n"
+                               f"幅度：<b>{data['pct']:+.2f}%</b>\n"
+                               f"時間：{datetime.now(tw_tz).strftime('%H:%M:%S')}")
+                        if send_telegram_msg(st.session_state.tg_token, st.session_state.tg_chat_id, msg):
+                            sent_count += 1
+                
+                if sent_count > 0:
+                    st.toast(f"✅ 掃描完成！共發送 {sent_count} 則符合門檻的通知", icon="🚀")
                 else:
-                    st.error("❌ 發送失敗，請檢查 Token/ChatID 或機器人是否已 Start")
+                    st.info("ℹ️ 掃描完成，目前清單中沒有股票符合門檻設定。")
         else:
-            st.warning("請先填寫通知設定並至少新增一檔股票")
+            st.warning("請先完成通知設定並新增股票")
 
 # --- 5. 監控顯示與自動邏輯 ---
 if not is_open:
-    st.info("💡 目前非交易時段，自動通知已暫停。您可以點擊上方「測試通知」驗證連線。")
+    st.info("💡 目前非交易時段，自動通知暫停。您可以點擊上方「手動全掃描測試」來驗證。")
 
 for index, stock in enumerate(st.session_state.my_stocks):
     data = get_stock_data(stock["id"])
