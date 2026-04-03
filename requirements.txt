@@ -4,3 +4,4 @@ FinMind
 pandas
 requests
 pytz
+tqdm
