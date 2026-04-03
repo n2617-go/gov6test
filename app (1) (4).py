@@ -1,249 +1,167 @@
 import streamlit as st
+import yfinance as yf
 import pandas as pd
-import requests
 import time
-from datetime import datetime, timedelta
+import random
+import requests
+import pytz
+import json
+import os
+from datetime import datetime, time as dt_time
+from FinMind.data import DataLoader
 
-# ══════════════════════════════════════════════════════════
-# 1. 核心 API 抓取
-# ══════════════════════════════════════════════════════════
-def fetch_finmind_api(dataset, data_id, token, days=90):
-    url = "https://api.finmindtrade.com/api/v4/data"
-    start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+# --- 0. 時區與檔案設定 ---
+tw_tz = pytz.timezone('Asia/Taipei')
+SAVE_FILE = "my_stocks_settings.json"
 
-    params = {
-        "dataset": dataset,
-        "start_date": start_date
-    }
-
-    if data_id:
-        params["data_id"] = data_id
-
-    # ✅ 修正重點：token 必須放在 Authorization Header (Bearer)，不能放在 params
-    headers = {
-        "Authorization": "Bearer " + token,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"
-    }
-
-    try:
-        res = requests.get(url, params=params, headers=headers, timeout=15)
-
-        if res.status_code != 200:
-            try:
-                err_msg = res.json().get("msg", "HTTP " + str(res.status_code))
-            except Exception:
-                err_msg = "HTTP " + str(res.status_code)
-            return pd.DataFrame(), err_msg
-
-        result = res.json()
-        if result.get("msg") == "success" and result.get("data"):
-            df = pd.DataFrame(result["data"])
-            return df, "success"
-        else:
-            return pd.DataFrame(), result.get("msg", "Empty Data")
-    except Exception as e:
-        return pd.DataFrame(), str(e)
-
-
-def analyze_stock(df, m_list):
-    df = df.copy()
-
-    # ✅ 正確欄位對應 (TaiwanStockPrice 實際欄位)
-    rename_map = {
-        'close': 'Close',
-        'max': 'High',
-        'min': 'Low',
-        'open': 'Open',
-        'Trading_Volume': 'Volume'
-    }
-    df = df.rename(columns=rename_map)
-
-    for col in ['Close', 'High', 'Low', 'Open']:
-        if col not in df.columns:
-            return 50, ["缺少欄位 " + col], pd.Series(), pd.Series()
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    if 'Volume' in df.columns:
-        df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
-
-    df = df.dropna(subset=['Close'])
-
-    if len(df) < 20:
-        return 50, [], df.iloc[-1], df.iloc[-2]
-
-    # RSI (14)
-    diff = df['Close'].diff()
-    gain = (diff.where(diff > 0, 0)).rolling(14).mean()
-    loss = (-diff.where(diff < 0, 0)).rolling(14).mean()
-    df['RSI'] = 100 - (100 / (1 + (gain / (loss + 0.00001))))
-
-    # KD (9, 3, 3)
-    low9 = df['Low'].rolling(9).min()
-    high9 = df['High'].rolling(9).max()
-    rsv = 100 * ((df['Close'] - low9) / (high9 - low9 + 0.00001))
-    df['K'] = rsv.ewm(com=2, adjust=False).mean()
-    df['D'] = df['K'].ewm(com=2, adjust=False).mean()
-
-    # MACD
-    e12 = df['Close'].ewm(span=12, adjust=False).mean()
-    e26 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['OSC'] = (e12 - e26) - (e12 - e26).ewm(span=9, adjust=False).mean()
-
-    # 布林 (20, 2)
-    ma20 = df['Close'].rolling(20).mean()
-    df['Upper'] = ma20 + (df['Close'].rolling(20).std() * 2)
-
-    last, prev = df.iloc[-1], df.iloc[-2]
-    matches = []
-
-    if "KD" in m_list and last['K'] < 35 and last['K'] > prev['K']:
-        matches.append("🔥 KD低檔轉強")
-    if "MACD" in m_list and last['OSC'] > 0 and prev['OSC'] <= 0:
-        matches.append("🚀 MACD翻紅")
-    if "RSI" in m_list and last['RSI'] > 50 and prev['RSI'] <= 50:
-        matches.append("📈 RSI強勢突破")
-    if "布林通道" in m_list and last['Close'] > last['Upper']:
-        matches.append("🌌 突破布林上軌")
-    if "成交量" in m_list and 'Volume' in df.columns:
-        vol_mean = df['Volume'].tail(5).mean()
-        if vol_mean and last['Volume'] > vol_mean * 1.5:
-            matches.append("📊 量能爆發")
-
-    score = 50 + (len(matches) * 10) if last['Close'] >= prev['Close'] else 50 - (len(matches) * 5)
-    return int(score), matches, last, prev
-
-
-# ══════════════════════════════════════════════════════════
-# 2. UI 樣式
-# ══════════════════════════════════════════════════════════
-st.set_page_config(page_title="台股極短線 AI 監控", layout="centered")
-
-# ✅ CSS 用字串串接，避免 Python 3.14 tokenizer 誤解 rgba 小數
-_CSS = (
-    "<style>"
-    "html, body, [data-testid='stAppViewContainer'] { background-color: #0a0d14 !important; color: white; }"
-    ".card { background:#111827; padding:20px; border-radius:12px; border-left:6px solid #38bdf8;"
-    " margin-bottom:15px; border: 1px solid #1e2533; }"
-    ".tag { background: #0e2233; color: #38bdf8; padding: 2px 8px; border-radius: 4px;"
-    " font-size: 0.75rem; margin-right: 5px; border: 1px solid #1e4d6b; }"
-    "</style>"
-)
-st.markdown(_CSS, unsafe_allow_html=True)
-
-if "auth" not in st.session_state:
-    st.session_state.auth = False
-if "tk" not in st.session_state:
-    st.session_state.tk = ""
-if "watchlist" not in st.session_state:
-    st.session_state.watchlist = ["2330", "2317", "2603", "2454"]
-
-# ══════════════════════════════════════════════════════════
-# 登入驗證
-# ══════════════════════════════════════════════════════════
-if not st.session_state.auth:
-    st.title("🛡️ 專業版授權驗證")
-    t_input = st.text_input("輸入 FinMind Token", type="password")
-    if st.button("驗證並開啟 AI 監控", use_container_width=True):
-        check_df, msg = fetch_finmind_api("TaiwanStockInfo", None, t_input)
-        if not check_df.empty:
-            st.session_state.tk = t_input
-            st.session_state.auth = True
-            st.rerun()
-        else:
-            st.error("❌ 驗證失敗。原因：" + msg)
-    st.stop()
-
-# ══════════════════════════════════════════════════════════
-# 3. 監控面板
-# ══════════════════════════════════════════════════════════
-st.title("⚡ AI 自動監控中")
-
-with st.sidebar:
-    st.header("⚙️ 參數設定")
-    m_list = st.multiselect(
-        "啟用指標",
-        ["KD", "MACD", "RSI", "布林通道", "成交量"],
-        default=["KD", "MACD", "RSI", "布林通道", "成交量"]
-    )
-    warn_p = st.slider("預警比例 (%)", 0.5, 5.0, 1.5)
-
-    new_code = st.text_input("新增股票代碼")
-    if st.button("➕ 加入監控"):
-        if new_code and new_code not in st.session_state.watchlist:
-            st.session_state.watchlist.append(new_code.strip())
-            st.rerun()
-
-    if st.button("🚪 登出系統"):
-        st.session_state.auth = False
-        st.rerun()
-
-
-# 股票名稱快取
-@st.cache_data(ttl=3600)
-def get_name_map(token):
-    df, _ = fetch_finmind_api("TaiwanStockInfo", None, token)
-    return dict(zip(df['stock_id'], df['stock_name'])) if not df.empty else {}
-
-
-name_map = get_name_map(st.session_state.tk)
-
-# ══════════════════════════════════════════════════════════
-# 顯示標的卡片
-# ✅ 修正：dataset 名稱改為正確的 TaiwanStockPrice
-# ══════════════════════════════════════════════════════════
-for code in list(st.session_state.watchlist):
-    df, msg = fetch_finmind_api("TaiwanStockPrice", code, st.session_state.tk)
-
-    if not df.empty and len(df) >= 2:
-        c_name = name_map.get(code, "個股 " + code)
-        score, matches, last, prev = analyze_stock(df, m_list)
-
-        if isinstance(last, pd.Series) and last.empty:
-            st.warning("⚠️ " + code + ": 資料不足，無法分析")
-            continue
-
-        chg = (last['Close'] - prev['Close']) / prev['Close'] * 100
-        color = "#ef4444" if chg > 0 else "#22c55e"
-        tags_html = "".join(['<span class="tag">' + m + '</span>' for m in matches])
-        last_date = str(last.get('date', ''))[:10]
-        close_str = str(round(last['Close'], 2))
-        chg_str = ("+" if chg >= 0 else "") + str(round(chg, 2)) + "%"
-
-        st.markdown(
-            '<div class="card" style="border-left-color: ' + color + '">'
-            + '<div style="float:right; font-size:24px; font-weight:bold; color:' + color
-            + '; border:2px solid ' + color
-            + '; border-radius:50%; width:50px; height:50px; display:flex; align-items:center; justify-content:center;">'
-            + str(score) + '</div>'
-            + '<div style="font-size:1rem; font-weight:bold;">' + c_name + ' (' + code
-            + ') <span style="font-size:0.7rem; color:#94a3b8;">[' + last_date + ']</span></div>'
-            + '<div style="font-size:1.8rem; font-weight:900; color:' + color + '; margin:10px 0;">'
-            + close_str + ' <span style="font-size:1rem;">(' + chg_str + ')</span></div>'
-            + '<div><b>符合指標：</b><br>' + (tags_html if tags_html else "分析中...") + '</div>'
-            + '</div>',
-            unsafe_allow_html=True
-        )
-
-        if st.button("🗑️ 移除 " + code, key="del_" + code):
-            st.session_state.watchlist.remove(code)
-            st.rerun()
+# --- 1. 檔案存取功能 ---
+def load_data():
+    """從 JSON 檔案載入股票清單與設定"""
+    if os.path.exists(SAVE_FILE):
+        with open(SAVE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
     else:
-        st.warning("⚠️ " + code + ": 抓取失敗 (" + msg + ")")
+        # 預設初始值
+        return {
+            "stocks": [{"id": "2330", "name": "台積電"}, {"id": "00631L", "name": "元大台灣50正2"}],
+            "tg_token": "",
+            "tg_chat_id": "",
+            "tg_threshold": 3.0
+        }
 
-# ══════════════════════════════════════════════════════════
-# 自動刷新
-# ══════════════════════════════════════════════════════════
-st.divider()
-col1, col2 = st.columns([3, 1])
-with col1:
-    st.caption("⏱️ 每 60 秒自動刷新一次")
-with col2:
-    if st.button("🔄 立即刷新"):
-        st.rerun()
+def save_data():
+    """將目前的 session_state 存入 JSON 檔案"""
+    data = {
+        "stocks": st.session_state.my_stocks,
+        "tg_token": st.session_state.get('tg_token', ''),
+        "tg_chat_id": st.session_state.get('tg_chat_id', ''),
+        "tg_threshold": st.session_state.get('tg_threshold', 3.0)
+    }
+    with open(SAVE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
 
-placeholder = st.empty()
-for remaining in range(60, 0, -1):
-    placeholder.caption("下次刷新倒數：" + str(remaining) + " 秒")
-    time.sleep(1)
-placeholder.empty()
-st.rerun()
+# 初始化 Session State (僅在第一次執行)
+if 'initialized' not in st.session_state:
+    saved_config = load_data()
+    st.session_state.my_stocks = saved_config["stocks"]
+    st.session_state.tg_token = saved_config["tg_token"]
+    st.session_state.tg_chat_id = saved_config["tg_chat_id"]
+    st.session_state.tg_threshold = saved_config["tg_threshold"]
+    st.session_state.initialized = True
+
+# --- 2. 頁面配置與 CSS ---
+st.set_page_config(page_title="台股永久自選監控", layout="centered")
+st.markdown("""
+    <style>
+    [data-testid="stMetricDelta"] svg { display: none; }
+    .status-box { padding: 12px; border-radius: 8px; margin-bottom: 20px; text-align: center; font-weight: bold; }
+    .open { background-color: #ffe6e6; color: #ff0000; border: 1px solid #ff0000; }
+    .closed { background-color: #f0f2f6; color: #555; border: 1px solid #ccc; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# --- 3. 核心功能函數 (與之前相同) ---
+def get_market_status():
+    now_tw = datetime.now(tw_tz)
+    if now_tw.weekday() >= 5: return f"休市中 (週末) - {now_tw.strftime('%H:%M')}", False
+    if dt_time(9, 0) <= now_tw.time() <= dt_time(13, 35):
+        return f"⚡ 開盤中 - {now_tw.strftime('%H:%M')}", True
+    return f"🌙 休市中 - {now_tw.strftime('%H:%M')}", False
+
+def send_telegram_msg(token, chat_id, message):
+    if token and chat_id:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        try: requests.post(url, json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}, timeout=5)
+        except: pass
+
+dl = DataLoader()
+status_label, is_open = get_market_status()
+
+@st.cache_data(ttl=60 if is_open else 3600)
+def get_stock_data(stock_id):
+    if is_open:
+        try:
+            now_s = datetime.now(tw_tz).strftime('%Y-%m-%d')
+            start_s = (datetime.now(tw_tz) - pd.Timedelta(days=10)).strftime('%Y-%m-%d')
+            df = dl.taiwan_stock_price(stock_id=stock_id, start_date=start_s, end_date=now_s)
+            if not df.empty:
+                df = df.dropna(subset=['close'])
+                curr, prev = float(df.iloc[-1]['close']), float(df.iloc[-2]['close'])
+                return {"price": curr, "change": curr - prev, "pct": (curr-prev)/prev*100, "src": "FinMind"}
+        except: pass
+    
+    for suffix in [".TW", ".TWO"]:
+        try:
+            time.sleep(random.uniform(0.2, 0.5))
+            df = yf.download(f"{stock_id}{suffix}", period="10d", progress=False)
+            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+            df = df.dropna(subset=['Close'])
+            if len(df) >= 2:
+                curr, prev = float(df.iloc[-1]['Close']), float(df.iloc[-2]['Close'])
+                return {"price": curr, "change": curr - prev, "pct": (curr-prev)/prev*100, "src": f"yf{suffix}"}
+        except: continue
+    return None
+
+# --- 4. 主介面 ---
+st.title("📈 永久自選股監控")
+st.markdown(f'<div class="status-box {"open" if is_open else "closed"}">{status_label}</div>', unsafe_allow_html=True)
+
+# A. 管理自選股
+with st.expander("➕ 新增/管理股票"):
+    col_id, col_name, col_btn = st.columns([2, 3, 1])
+    new_id = col_id.text_input("代號")
+    new_name = col_name.text_input("名稱")
+    if col_btn.button("新增"):
+        if new_id and new_name:
+            if not any(s['id'] == new_id for s in st.session_state.my_stocks):
+                st.session_state.my_stocks.append({"id": new_id, "name": new_name})
+                save_data() # 存入檔案
+                st.cache_data.clear()
+                st.rerun()
+        else: st.error("請輸入完整資訊")
+
+# B. Telegram 設定
+with st.expander("🔔 通知設定"):
+    st.session_state.tg_token = st.text_input("Bot Token", type="password", value=st.session_state.tg_token)
+    st.session_state.tg_chat_id = st.text_input("Chat ID", value=st.session_state.tg_chat_id)
+    st.session_state.tg_threshold = st.number_input("門檻 %", value=st.session_state.tg_threshold)
+    if st.button("儲存設定並測試"):
+        save_data() # 存入檔案
+        send_telegram_msg(st.session_state.tg_token, st.session_state.tg_chat_id, "✅ 設定已成功永久保存！")
+        st.success("設定已存入伺服器本地空間")
+
+# C. 股票列表
+if 'alert_history' not in st.session_state: st.session_state.alert_history = {}
+
+for index, stock in enumerate(st.session_state.my_stocks):
+    data = get_stock_data(stock["id"])
+    with st.container(border=True):
+        c1, c2, c3 = st.columns([3, 2, 1])
+        if data:
+            with c1:
+                st.subheader(stock["name"])
+                st.caption(f"{stock['id']} | {data['src']}")
+            with c2:
+                st.metric(label="現價", value=f"{data['price']:.2f}", 
+                          delta=f"{data['change']:+.2f} ({data['pct']:+.2f}%)", delta_color="inverse")
+            if c3.button("🗑️", key=f"del_{stock['id']}"):
+                st.session_state.my_stocks.pop(index)
+                save_data() # 同步更新檔案
+                st.rerun()
+
+            # 自動通知
+            if st.session_state.tg_token and st.session_state.tg_chat_id and abs(data['pct']) >= st.session_state.tg_threshold:
+                today_key = f"{stock['id']}_{datetime.now(tw_tz).strftime('%Y%m%d')}"
+                if today_key not in st.session_state.alert_history:
+                    send_telegram_msg(st.session_state.tg_token, st.session_state.tg_chat_id, f"🚨 {stock['name']} 異動：{data['pct']:+.2f}%")
+                    st.session_state.alert_history[today_key] = True
+        else:
+            st.error(f"無法讀取 {stock['id']}")
+            if c3.button("🗑️", key=f"err_{stock['id']}"):
+                st.session_state.my_stocks.pop(index)
+                save_data()
+                st.rerun()
+
+if st.button("🔄 立即刷新"):
+    st.cache_data.clear()
+    st.rerun()
